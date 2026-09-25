@@ -234,11 +234,15 @@ class AclSandbox:
             # fallback, ``world_sid``) passes.  The measured rule and the six rows
             # behind it are in ``token.set_token_default_dacl_grant``'s docstring
             # — read it before changing this argument (issue #1560).
-            set_token_default_dacl_grant(
-                bindings,
-                restricted_token,
-                self._temp_write_sid_ptr or self._write_sid_ptr or world_sid.address,
-            )
+            default_dacl_sid = self._temp_write_sid_ptr or self._write_sid_ptr or world_sid.address
+            set_token_default_dacl_grant(bindings, restricted_token, default_dacl_sid)
+            if self._write_sid_ptr is not None or self._temp_write_sid_ptr is not None:
+                # The grant above names a write SID, and both write SIDs are
+                # restricting-only — pass 1 denies them, so the ACE decides
+                # nothing and a new object is denied to the child that made it
+                # (#1615).  The logon SID is the one SID this token carries in
+                # *both* lists, at either mode, and its buffer is owned above.
+                set_token_default_dacl_grant(bindings, restricted_token, logon_sid.address)
             if int(bindings.kernel32.CloseHandle(ctypes.c_void_p(current_token))) == 0:
                 throw_last_error(bindings, "CloseHandle", "current process token")
             token_open = False

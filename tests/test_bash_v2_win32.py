@@ -1291,3 +1291,64 @@ def test_init_owns_every_sid_the_restricted_token_is_pointed_at(tmp_path, monkey
     assert len(api.kernel32.closed) == 2, "both the current and the restricted token are closed"
 
 
+class _FakeWriteAclApi(_FakeAclApi):
+    """``_FakeAclApi`` plus the one call a ``workspace-write`` ``init`` adds.
+
+    A write SID arrives as a string and is parsed; the fake hands back a buffer it
+    owns, so the address it granted is still recognizable after ``init`` returns.
+    """
+
+    def __init__(self, blob: bytes = b"SIDBLOB!") -> None:
+        super().__init__(blob)
+        self.parsed_sids: list[int] = []
+        self._parsed_buffers: list[ctypes.Array] = []
+
+    def ConvertStringSidToSidW(self, sid, sid_ref):
+        buffer = (ctypes.c_ubyte * len(self.blob)).from_buffer_copy(self.blob)
+        self._parsed_buffers.append(buffer)
+        self.parsed_sids.append(ctypes.addressof(buffer))
+        sid_ref._obj.value = ctypes.addressof(buffer)
+        return 1
+
+
+def test_a_workspace_write_grant_names_a_sid_in_both_lists(tmp_path, monkeypatch):
+    """#1615: the write SID is restricting-only, so a second ACE names the logon SID.
+
+    The token's access check is a pass over its enabled groups and a second pass
+    over its restricting ones, and both write SIDs sit in the restricting list
+    only — so a default DACL naming one of them decides nothing, and a new object
+    is denied to the child that created it.  The logon SID is the one SID this
+    token carries in *both* lists, at either mode, and its buffer is already owned
+    at the call site.  The read-only branch keeps its single EVERYONE grant, which
+    ``test_init_owns_every_sid_the_restricted_token_is_pointed_at`` still pins.
+
+    ``manage_dacls=False`` is the seam's own configuration rather than a
+    shortcut: under it the directory grants belong to the caller, and the
+    default-DACL grant is the half this test is about.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    api = _FakeWriteAclApi()
+    granted_to: list[int] = []
+    monkeypatch.setattr(
+        "emrg.sandbox.win32.sandbox.set_token_default_dacl_grant",
+        lambda bindings, token, sid_ptr: granted_to.append(sid_ptr),
+    )
+    sandbox = AclSandbox(
+        writable_dirs=[str(workspace)],
+        temp_dir=None,
+        mode="workspace-write",
+        write_sid="S-1-4-0-0",
+        manage_dacls=False,
+    )
+    sandbox.init(api=api)
+
+    assert len(sandbox._owned_sids) == 2, "the logon SID is first, the Everyone SID second"
+    logon_sid = ctypes.addressof(sandbox._owned_sids[0])
+    assert granted_to == [api.parsed_sids[0], logon_sid], (
+        "the write SID alone is denied by the enabled-group pass, so the default "
+        "DACL has to name a SID from both of the token's lists as well"
+    )
+    sandbox.dispose()
+
+
